@@ -54,6 +54,8 @@ local state = {
 	skipped_outro = false,
 	last_time_pos = nil,
 	first_time_pos = true,
+	intro_retry_deadline = nil,
+	last_seek_time = 0,
 	detected = {
 		intro_start = nil,
 		intro_end = nil,
@@ -81,6 +83,15 @@ local function fmt_time(sec)
 	local m = math.floor(sec / 60)
 	local s = sec % 60
 	return string.format('%02d:%02d', m, s)
+end
+
+local function build_skip_osd(start_time, end_time, span_override, suffix)
+	if not is_number(start_time) then start_time = 0 end
+	if not is_number(end_time) then end_time = start_time end
+	local line1 = string.format('从 %s >> %s%s', fmt_time(start_time), fmt_time(end_time), suffix and (' ' .. suffix) or '')
+	local span = is_number(span_override) and span_override or (end_time - start_time)
+	local line2 = string.format('本次跳过 %s', fmt_time(math.max(0, span)))
+	return line1 .. '\n' .. line2
 end
 
 local function parse_time_input(str)
@@ -200,10 +211,13 @@ local function compute_detected_ranges()
 end
 
 local function effective_intro_range()
+	if state.intro_len > 0 then
+		return 0, clamp(state.intro_len, 0, o.manual_limit_sec)
+	end
 	if state.prefer_chapters and is_number(state.detected.intro_end) and state.detected.intro_end > 0 then
 		return state.detected.intro_start or 0, state.detected.intro_end
 	end
-	return 0, clamp(state.intro_len, 0, o.manual_limit_sec)
+	return 0, 0
 end
 
 local function effective_intro_len() -- 兼容旧接口，主要用于 UI 显示时长
@@ -212,10 +226,13 @@ local function effective_intro_len() -- 兼容旧接口，主要用于 UI 显示
 end
 
 local function effective_outro_len()
+	if state.outro_len > 0 then
+		return clamp(state.outro_len, 0, o.manual_limit_sec)
+	end
 	if state.prefer_chapters and is_number(state.detected.outro_len) and state.detected.outro_len > 0 then
 		return state.detected.outro_len
 	end
-	return clamp(state.outro_len, 0, o.manual_limit_sec)
+	return 0
 end
 
 local function update_uosc_button()
@@ -246,8 +263,9 @@ local function seek_absolute(sec)
 end
 
 local function skip_intro_now()
-	local _, intro_end = effective_intro_range()
+	local intro_start, intro_end = effective_intro_range()
 	if intro_end > 0 then
+		osd(build_skip_osd(intro_start, intro_end))
 		seek_absolute(intro_end)
 	end
 end
@@ -259,6 +277,7 @@ local function skip_outro_now()
 	if outro <= 0 then return end
 	local target = duration - 0.2
 	if target < 0 then target = 0 end
+	osd(build_skip_osd(duration - outro, target, outro))
 	seek_absolute(target)
 end
 
@@ -266,19 +285,42 @@ reset_skip_state = function()
 	state.skipped_intro = false
 	state.skipped_outro = false
 	state.first_time_pos = true
+	state.last_time_pos = nil
+	state.intro_retry_deadline = nil
+	state.last_seek_time = 0
 end
 
 local function handle_intro_skip(time_pos, intro_start, intro_end)
 	if intro_end <= intro_start then return false end
 
+	-- 检查是否需要重试（针对网络流 seek 失败的情况）
+	if state.skipped_intro and state.intro_retry_deadline then
+		local now = mp.get_time()
+		if now < state.intro_retry_deadline then
+			-- 还在片头范围内，且距离上次 seek 超过 1 秒 -> 重试
+			if time_pos < intro_end and (now - state.last_seek_time) > 1.0 then
+				state.last_seek_time = now
+				osd(build_skip_osd(intro_start, intro_end, nil, '(重试)'))
+				seek_absolute(intro_end)
+			end
+			return true
+		else
+			state.intro_retry_deadline = nil -- 超过重试窗口，停止重试
+		end
+	end
+
 	if time_pos >= intro_start and time_pos < intro_end then
 		if not state.skipped_intro then
 			state.skipped_intro = true
+			state.last_seek_time = mp.get_time()
+			state.intro_retry_deadline = state.last_seek_time + 6.0 -- 6秒内允许重试
+			osd(build_skip_osd(intro_start, intro_end))
 			seek_absolute(intro_end)
 		end
 		return true
 	elseif time_pos >= intro_end then
 		state.skipped_intro = true
+		state.intro_retry_deadline = nil
 	end
 
 	return false
@@ -312,6 +354,7 @@ local function apply_auto_skip(time_pos)
 
 	if not state.skipped_outro and time_pos >= (duration - outro) then
 		state.skipped_outro = true
+		osd(build_skip_osd(duration - outro, duration, outro))
 		skip_outro_now()
 	end
 end
@@ -322,10 +365,6 @@ local function set_intro_len_from_time_pos()
 	state.intro_len = clamp(pos, 0, o.manual_limit_sec)
 	reset_skip_state() -- 重置状态以允许再次跳过
 	osd(string.format('片头时长：%s', fmt_time(state.intro_len)))
-	-- 设置后立即检查是否需要跳过片头
-	if is_number(pos) and pos >= 0 then
-		apply_auto_skip(pos)
-	end
 end
 
 local function set_outro_len_from_time_pos()
@@ -485,6 +524,13 @@ mp.register_script_message('uosc-callback', function(json)
 			if o.pause_on_menu and not state.was_paused then
 				mp.set_property_native('pause', false)
 			end
+			if state.enabled then
+				reset_skip_state()
+				local time_pos = mp.get_property_native('time-pos', nil)
+				if is_number(time_pos) then
+					apply_auto_skip(time_pos)
+				end
+			end
 			return
 		end
 		if ev.type == 'search' then
@@ -496,26 +542,21 @@ mp.register_script_message('uosc-callback', function(json)
 			end
 
 			if which then
-			local n = parse_time_input(ev.query)
-			if not n then
-				osd('格式错误，支持：90、1:30、1.30')
-				return
+				local n = parse_time_input(ev.query)
+				if not n then
+					osd('格式错误，支持：90、1:30、1.30')
+					return
+				end
+				if which == 'intro' then
+					state.intro_len = clamp(n, 0, o.manual_limit_sec)
+					osd(string.format('片头时长：%s', fmt_time(state.intro_len)))
+				else
+					state.outro_len = clamp(n, 0, o.manual_limit_sec)
+					osd(string.format('片尾时长：%s', fmt_time(state.outro_len)))
+				end
+				reset_skip_state()
+				update_menu()
 			end
-			if which == 'intro' then
-				state.intro_len = clamp(n, 0, o.manual_limit_sec)
-				osd(string.format('片头时长：%s', fmt_time(state.intro_len)))
-			else
-				state.outro_len = clamp(n, 0, o.manual_limit_sec)
-				osd(string.format('片尾时长：%s', fmt_time(state.outro_len)))
-			end
-			reset_skip_state()
-			update_menu()
-			-- 从菜单设置后立即检查是否需要跳过
-			local time_pos = mp.get_property_native('time-pos', nil)
-			if is_number(time_pos) and time_pos >= 0 then
-				apply_auto_skip(time_pos)
-			end
-		end
 			return
 		end
 
@@ -613,16 +654,14 @@ mp.register_event('start-file', function()
 end)
 
 mp.register_event('file-loaded', function()
+	reset_skip_state()
 	compute_detected_ranges()
-	update_menu()
-	update_uosc_button()
-	-- 文件加载完成后，立即检查是否需要跳过片头
-	-- 这确保了章节检测数据更新后能正确应用跳过逻辑
 	local time_pos = mp.get_property_native('time-pos', nil)
-	if is_number(time_pos) and time_pos >= 0 then
-		state.first_time_pos = true
+	if is_number(time_pos) then
 		apply_auto_skip(time_pos)
 	end
+	update_menu()
+	update_uosc_button()
 end)
 
 mp.observe_property('chapter-list', 'native', function()
@@ -638,4 +677,3 @@ end)
 mp.observe_property('time-pos', 'native', function(_, v)
 	apply_auto_skip(v)
 end)
-
